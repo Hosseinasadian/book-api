@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -64,6 +65,11 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
+	})
+
+	r.Route("/api", func(r chi.Router) {
+		r.Get("/books", getBooks)
+		r.Get("/books/{id}", getBookByID)
 	})
 
 	log.Printf("🚀 Server starting on port %s", port)
@@ -141,4 +147,125 @@ func initTables() {
 	}
 
 	log.Println("✅ Database tables initialized")
+}
+
+type Book struct {
+	ID          string    `json:"id" db:"id"`
+	Title       string    `json:"title" db:"title"`
+	Author      string    `json:"author" db:"author"`
+	CoverURL    string    `json:"coverUrl" db:"cover_url"`
+	Description string    `json:"description" db:"description"`
+	Year        string    `json:"year" db:"year"`
+	Chapters    []Chapter `json:"chapters" db:"-"`
+	CreatedAt   time.Time `json:"createdAt" db:"created_at"`
+	UpdatedAt   time.Time `json:"updatedAt" db:"updated_at"`
+}
+
+type Chapter struct {
+	ID        string    `json:"id" db:"id"`
+	BookID    string    `json:"bookId" db:"book_id"`
+	Title     string    `json:"title" db:"title"`
+	Summary   string    `json:"summary" db:"summary"`
+	AudioURL  string    `json:"audioUrl" db:"audio_url"`
+	OrderNum  int       `json:"orderNum" db:"order_num"`
+	CreatedAt time.Time `json:"createdAt" db:"created_at"`
+}
+
+func getBooks(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		http.Error(w, "Database connection is not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	var books []Book
+	err := db.Select(&books, `
+		SELECT id, title, author, description, cover_url, year, created_at, updated_at 
+		FROM books 
+		ORDER BY created_at DESC
+	`)
+
+	if err != nil {
+		log.Printf("❌ Error fetching books from database: %v", err)
+		http.Error(w, "Failed to fetch books", http.StatusInternalServerError)
+		return
+	}
+
+	// اگر کتابی پیدا نشد
+	if len(books) == 0 {
+		// می‌توانیم داده‌های نمونه برگردانیم
+		books = []Book{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if err := json.NewEncoder(w).Encode(books); err != nil {
+		log.Printf("❌ Error encoding response: %v", err)
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
+}
+
+func getBookByID(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		http.Error(w, "Database connection is not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	bookID := chi.URLParam(r, "id")
+
+	// کوئری با JOIN برای دریافت همه چیز در یک درخواست
+	type BookWithChapters struct {
+		Book
+		ChapterID      sql.NullString `json:"-" db:"chapter_id"`
+		ChapterTitle   sql.NullString `json:"-" db:"chapter_title"`
+		ChapterSummary sql.NullString `json:"-" db:"chapter_summary"`
+		AudioURL       sql.NullString `json:"-" db:"audio_url"`
+		OrderNum       sql.NullInt32  `json:"-" db:"order_num"`
+	}
+
+	var rows []BookWithChapters
+	err := db.Select(&rows, `
+		SELECT 
+			b.id, b.title, b.author, b.description, b.cover_url, b.year, 
+			b.created_at, b.updated_at,
+			c.id as chapter_id, c.title as chapter_title, 
+			c.summary as chapter_summary, c.audio_url, c.order_num
+		FROM books b
+		LEFT JOIN chapters c ON b.id = c.book_id
+		WHERE b.id = $1
+		ORDER BY c.order_num ASC
+	`, bookID)
+
+	if err != nil {
+		log.Printf("❌ Error fetching book with chapters: %v", err)
+		http.Error(w, "Failed to fetch book", http.StatusInternalServerError)
+		return
+	}
+
+	if len(rows) == 0 {
+		http.Error(w, "Book not found", http.StatusNotFound)
+		return
+	}
+
+	var chapters []Chapter
+
+	book := rows[0].Book
+
+	for _, row := range rows {
+		if row.ChapterID.Valid {
+			chapters = append(chapters, Chapter{
+				ID:        row.ChapterID.String,
+				BookID:    bookID,
+				Title:     row.ChapterTitle.String,
+				Summary:   row.ChapterSummary.String,
+				AudioURL:  row.AudioURL.String,
+				OrderNum:  int(row.OrderNum.Int32),
+				CreatedAt: time.Now(), // اینجا نیاز به اصلاح دارید
+			})
+		}
+	}
+
+	book.Chapters = chapters
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(book)
 }
